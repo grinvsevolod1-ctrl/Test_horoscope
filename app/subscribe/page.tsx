@@ -47,17 +47,26 @@ const PLANS = [
   },
 ]
 
+function isValidTelegramUsername(username: string): boolean {
+  if (!username.startsWith("@")) return false
+  const name = username.slice(1)
+  if (name.length < 5 || name.length > 32) return false
+  return /^[a-zA-Z0-9_]+$/.test(name)
+}
 function SubscribeContent() {
   const searchParams = useSearchParams()
   const router = useRouter()
+
   const [step, setStep] = useState(1)
   const [isLoading, setIsLoading] = useState(false)
+
   const [formData, setFormData] = useState({
     zodiacSign: "",
     telegramUsername: "",
     plan: "plus",
   })
 
+  // Подхватываем тариф из URL
   useEffect(() => {
     const planFromUrl = searchParams.get("plan")
     if (planFromUrl && PLANS.some((p) => p.id === planFromUrl)) {
@@ -65,6 +74,7 @@ function SubscribeContent() {
     }
   }, [searchParams])
 
+  // 🔥 Исправленный handleSubmit — отправляет правильные поля
   const handleSubmit = async () => {
     setIsLoading(true)
 
@@ -72,18 +82,25 @@ function SubscribeContent() {
       const response = await fetch("/api/subscribe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(formData),
+        body: JSON.stringify({
+          telegram_username: formData.telegramUsername,
+          zodiac_sign: formData.zodiacSign,
+          plan_id: formData.plan,
+        }),
       })
 
       if (!response.ok) throw new Error("Failed to subscribe")
 
       const data = await response.json()
 
-      if (data.redirectUrl) {
-        window.location.href = data.redirectUrl
-      } else {
-        router.push("/checkout/success")
+      // bePaid возвращает checkout_url
+      if (data.checkout_url) {
+        window.location.href = data.checkout_url
+        return
       }
+
+      // fallback — если trial без оплаты
+      router.push("/checkout/success")
     } catch (error) {
       console.error("Subscription error:", error)
       alert("Ошибка при оформлении подписки. Попробуйте снова.")
@@ -92,8 +109,7 @@ function SubscribeContent() {
   }
 
   const selectedPlan = PLANS.find((p) => p.id === formData.plan)
-
-  return (
+return (
     <main className="min-h-[100dvh] bg-background">
       {/* Header */}
       <header className="sticky top-0 z-50 glass border-b border-border/50">
@@ -101,22 +117,24 @@ function SubscribeContent() {
           <Link href="/" className="p-2 -ml-2 rounded-xl hover:bg-muted/50 transition-colors">
             <ArrowLeft className="w-5 h-5" />
           </Link>
-          <div className="flex-1">
-            <div className="flex gap-1">
-              {[1, 2, 3].map((s) => (
-                <div
-                  key={s}
-                  className={`h-1 flex-1 rounded-full transition-colors ${s <= step ? "bg-primary" : "bg-muted"}`}
-                />
-              ))}
-            </div>
+
+          <div className="flex gap-1 flex-1">
+            {[1, 2, 3].map((s) => (
+              <div
+                key={s}
+                className={`h-1 flex-1 rounded-full transition-colors ${
+                  s <= step ? "bg-primary" : "bg-muted"
+                }`}
+              />
+            ))}
           </div>
+
           <span className="text-sm text-muted-foreground">Шаг {step}/3</span>
         </div>
       </header>
 
       <div className="max-w-lg mx-auto px-6 py-8">
-        {/* Step 1: Zodiac */}
+        {/* STEP 1 — Zodiac */}
         {step === 1 && (
           <div className="animate-in fade-in slide-in-from-right-4 duration-300">
             <h1 className="font-serif text-2xl font-medium mb-2 text-center">Ваш знак зодиака</h1>
@@ -148,7 +166,7 @@ function SubscribeContent() {
           </div>
         )}
 
-        {/* Step 2: Telegram */}
+        {/* STEP 2 — Telegram */}
         {step === 2 && (
           <div className="animate-in fade-in slide-in-from-right-4 duration-300">
             <h1 className="font-serif text-2xl font-medium mb-2 text-center">Ваш Telegram</h1>
@@ -157,23 +175,40 @@ function SubscribeContent() {
             <div className="space-y-4">
               <div>
                 <label className="text-sm font-medium mb-2 block">Имя пользователя</label>
+
                 <Input
                   placeholder="@username"
                   value={formData.telegramUsername}
-                  onChange={(e) => setFormData({ ...formData, telegramUsername: e.target.value })}
+                  onChange={(e) =>
+                    setFormData({ ...formData, telegramUsername: e.target.value })
+                  }
                   className="h-14 rounded-xl text-base glass border-0"
                 />
+
+                {formData.telegramUsername &&
+                  !isValidTelegramUsername(formData.telegramUsername) && (
+                    <p className="text-xs text-red-500 mt-2">
+                      Введите корректный Telegram username (например: @astro_user)
+                    </p>
+                  )}
               </div>
             </div>
 
             <div className="flex gap-3 mt-8">
-              <Button variant="outline" onClick={() => setStep(1)} className="flex-1 py-6 rounded-2xl glass border-0">
+              <Button
+                variant="outline"
+                onClick={() => setStep(1)}
+                className="flex-1 py-6 rounded-2xl glass border-0"
+              >
                 <ArrowLeft className="w-4 h-4 mr-2" />
                 Назад
               </Button>
+
               <Button
-                onClick={() => formData.telegramUsername && setStep(3)}
-                disabled={!formData.telegramUsername}
+                onClick={() =>
+                  isValidTelegramUsername(formData.telegramUsername) && setStep(3)
+                }
+                disabled={!isValidTelegramUsername(formData.telegramUsername)}
                 className="flex-1 py-6 rounded-2xl glow"
               >
                 Далее
@@ -183,11 +218,13 @@ function SubscribeContent() {
           </div>
         )}
 
-        {/* Step 3: Plan */}
+        {/* STEP 3 — Plan */}
         {step === 3 && (
           <div className="animate-in fade-in slide-in-from-right-4 duration-300">
             <h1 className="font-serif text-2xl font-medium mb-2 text-center">Выберите тариф</h1>
-            <p className="text-sm text-muted-foreground text-center mb-6">7 дней бесплатно на любом тарифе</p>
+            <p className="text-sm text-muted-foreground text-center mb-6">
+              7 дней бесплатно на любом тарифе
+            </p>
 
             <div className="space-y-3">
               {PLANS.map((plan) => (
@@ -201,10 +238,19 @@ function SubscribeContent() {
                   <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center gap-3">
                       <div
-                        className={`w-10 h-10 rounded-xl flex items-center justify-center ${plan.popular ? "bg-gradient-to-br from-primary to-accent" : "bg-muted"}`}
+                        className={`w-10 h-10 rounded-xl flex items-center justify-center ${
+                          plan.popular
+                            ? "bg-gradient-to-br from-primary to-accent"
+                            : "bg-muted"
+                        }`}
                       >
-                        <plan.icon className={`w-5 h-5 ${plan.popular ? "text-white" : "text-muted-foreground"}`} />
+                        <plan.icon
+                          className={`w-5 h-5 ${
+                            plan.popular ? "text-white" : "text-muted-foreground"
+                          }`}
+                        />
                       </div>
+
                       <div>
                         <div className="flex items-center gap-2">
                           <span className="font-medium">{plan.name}</span>
@@ -216,11 +262,13 @@ function SubscribeContent() {
                         </div>
                       </div>
                     </div>
+
                     <div className="text-right">
                       <span className="text-xl font-bold">{plan.price}</span>
                       <span className="text-sm text-muted-foreground"> BYN/мес</span>
                     </div>
                   </div>
+
                   <div className="flex flex-wrap gap-1.5">
                     {plan.features.map((f) => (
                       <span
@@ -241,10 +289,12 @@ function SubscribeContent() {
                 <span className="text-muted-foreground">Тариф {selectedPlan?.name}</span>
                 <span>{selectedPlan?.price} BYN/мес</span>
               </div>
+
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">7 дней бесплатно</span>
                 <span className="text-green-400">-{selectedPlan?.price} BYN</span>
               </div>
+
               <div className="border-t border-border/50 mt-3 pt-3 flex justify-between font-medium">
                 <span>Сегодня</span>
                 <span className="text-green-400">0 BYN</span>
@@ -252,11 +302,20 @@ function SubscribeContent() {
             </div>
 
             <div className="flex gap-3 mt-6">
-              <Button variant="outline" onClick={() => setStep(2)} className="flex-1 py-6 rounded-2xl glass border-0">
+              <Button
+                variant="outline"
+                onClick={() => setStep(2)}
+                className="flex-1 py-6 rounded-2xl glass border-0"
+              >
                 <ArrowLeft className="w-4 h-4 mr-2" />
                 Назад
               </Button>
-              <Button onClick={handleSubmit} disabled={isLoading} className="flex-1 py-6 rounded-2xl glow">
+
+              <Button
+                onClick={handleSubmit}
+                disabled={isLoading}
+                className="flex-1 py-6 rounded-2xl glow"
+              >
                 {isLoading ? (
                   <>
                     <Loader2 className="w-4 h-4 mr-2 animate-spin" />
@@ -280,7 +339,6 @@ function SubscribeContent() {
     </main>
   )
 }
-
 export default function SubscribePage() {
   return (
     <Suspense

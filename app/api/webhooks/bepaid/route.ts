@@ -1,25 +1,30 @@
 import { type NextRequest, NextResponse } from "next/server"
+import { neon } from "@neondatabase/serverless"
 import { verifyWebhookSignature, parseWebhookPayload } from "@/lib/bepaid"
 
-// Idempotency store (in production, use Redis or database)
+const sql = neon(process.env.DATABASE_URL!)
+
+// Idempotency store (в проде — Redis/DB)
 const processedTransactions = new Set<string>()
 
-// POST /api/webhooks/bepaid - Handle bePaid payment notifications
 export async function POST(request: NextRequest) {
   try {
     const signature = request.headers.get("x-bepaid-signature") || ""
-    const body = await request.text()
+    const rawBody = await request.text()
 
-    // Verify webhook signature (skip in development if no secret)
+    // 🔐 Проверка подписи (если секрет задан)
     if (process.env.BEPAID_WEBHOOK_SECRET) {
-      if (!verifyWebhookSignature(body, signature)) {
-        console.error("Invalid webhook signature")
+      const valid = verifyWebhookSignature(rawBody, signature)
+      if (!valid) {
+        console.error("❌ Invalid webhook signature")
         return NextResponse.json({ error: "Invalid signature" }, { status: 401 })
       }
     }
 
-    const payload = parseWebhookPayload(body)
+    // 📦 Парсим payload
+    const payload = parseWebhookPayload(rawBody)
     if (!payload) {
+      console.error("❌ Invalid payload")
       return NextResponse.json({ error: "Invalid payload" }, { status: 400 })
     }
 
@@ -27,19 +32,21 @@ export async function POST(request: NextRequest) {
     const transactionId = transaction.uid
     const orderId = transaction.tracking_id
 
-    // Idempotency check
+    // 🔁 Idempotency
     if (processedTransactions.has(transactionId)) {
-      console.log(`Transaction ${transactionId} already processed`)
+      console.log(`⚠️ Transaction ${transactionId} already processed`)
       return NextResponse.json({ status: "already_processed" })
     }
 
-    console.log(`Processing webhook for order ${orderId}:`, {
+    console.log("📩 Incoming bePaid webhook:", {
+      orderId,
+      transactionId,
       status: transaction.status,
       amount: transaction.amount,
       currency: transaction.currency,
       hasToken: !!transaction.payment?.token,
     })
-
+// --- Обработка статусов ---
     switch (transaction.status) {
       case "successful":
         await handleSuccessfulPayment({
@@ -47,7 +54,7 @@ export async function POST(request: NextRequest) {
           transactionId,
           amount: transaction.amount,
           currency: transaction.currency,
-          paymentToken: transaction.payment?.token,
+          paymentToken: transaction.payment?.token || null,
         })
         break
 
@@ -60,17 +67,14 @@ export async function POST(request: NextRequest) {
         break
 
       case "pending":
-        // Payment still processing, wait for final status
-        console.log(`Payment ${orderId} is pending`)
+        console.log(`⏳ Payment ${orderId} is pending`)
         break
 
       default:
-        console.log(`Unknown payment status: ${transaction.status}`)
+        console.log(`⚠️ Unknown payment status: ${transaction.status}`)
     }
 
-    // Mark as processed
     processedTransactions.add(transactionId)
-
     return NextResponse.json({ status: "ok" })
   } catch (error) {
     console.error("Webhook processing error:", error)
@@ -78,78 +82,112 @@ export async function POST(request: NextRequest) {
   }
 }
 
+
+// ===============================
+//   SUCCESSFUL PAYMENT HANDLER
+// ===============================
+
 async function handleSuccessfulPayment(params: {
   orderId: string
   transactionId: string
   amount: number
   currency: string
-  paymentToken?: string
+  paymentToken: string | null
 }) {
-  console.log(`Payment successful for order ${params.orderId}`)
+  console.log(`💰 Payment successful for order ${params.orderId}`)
 
-  // In production:
-  // 1. Find pending payment by orderId
-  // 2. Update payment status to 'succeeded'
-  // 3. Save payment_token for recurring charges
-  // 4. Activate or extend subscription (renew_at = +30 days)
-  // 5. Send confirmation to user via Telegram bot
+  // 1) Находим платеж
+  const payments = await sql`
+    SELECT * FROM payments
+    WHERE order_id = ${params.orderId}
+    LIMIT 1
+  `
 
-  /*
-  await db.transaction(async (tx) => {
-    // Update payment
-    const payment = await tx.payments.update({
-      where: { order_id: params.orderId },
-      data: {
-        status: 'succeeded',
-        provider_payment_id: params.transactionId,
-      },
-    })
+  if (payments.length === 0) {
+    console.error("❌ Payment not found in DB")
+    return
+  }
 
-    // Update subscription
-    await tx.subscriptions.update({
-      where: { id: payment.subscription_id },
-      data: {
-        status: 'active',
-        payment_token: params.paymentToken,
-        renew_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-        last_payment_id: payment.id,
-      },
-    })
+  const payment = payments[0]
 
-    // Notify user via bot
-    await notifyUser(payment.user_id, 'payment_success')
-  })
-  */
+  // 2) Обновляем статус платежа
+  await sql`
+    UPDATE payments
+    SET status = 'succeeded',
+        provider_payment_id = ${params.transactionId},
+        updated_at = NOW()
+    WHERE id = ${payment.id}
+  `
+
+  // 3) Активируем подписку
+  const renewAt = new Date()
+  renewAt.setDate(renewAt.getDate() + 30)
+
+  await sql`
+    UPDATE subscriptions
+    SET status = 'active',
+        payment_token = ${params.paymentToken},
+        renew_at = ${renewAt.toISOString()},
+        last_payment_id = ${payment.id},
+        updated_at = NOW()
+    WHERE id = ${payment.subscription_id}
+  `
+
+  console.log(`🎉 Subscription ${payment.subscription_id} activated until ${renewAt.toISOString()}`)
+
+  // 4) (опционально) уведомление бота
+  // await notifyUser(payment.user_id, "payment_success")
 }
+// ===============================
+//   FAILED PAYMENT HANDLER
+// ===============================
 
-async function handleFailedPayment(params: { orderId: string; transactionId: string; amount: number }) {
-  console.log(`Payment failed for order ${params.orderId}`)
+async function handleFailedPayment(params: {
+  orderId: string
+  transactionId: string
+  amount: number
+}) {
+  console.log(`❌ Payment failed for order ${params.orderId}`)
 
-  // In production:
-  // 1. Update payment status to 'failed'
-  // 2. If subscription exists, set to 'grace' period (3 days)
-  // 3. Notify user via Telegram bot
+  // 1) Находим платеж
+  const payments = await sql`
+    SELECT * FROM payments
+    WHERE order_id = ${params.orderId}
+    LIMIT 1
+  `
 
-  /*
-  await db.transaction(async (tx) => {
-    const payment = await tx.payments.update({
-      where: { order_id: params.orderId },
-      data: {
-        status: 'failed',
-        provider_payment_id: params.transactionId,
-      },
-    })
+  if (payments.length === 0) {
+    console.error("❌ Payment not found in DB")
+    return
+  }
 
-    if (payment.subscription_id) {
-      await tx.subscriptions.update({
-        where: { id: payment.subscription_id },
-        data: {
-          status: 'grace',
-        },
-      })
-    }
+  const payment = payments[0]
 
-    await notifyUser(payment.user_id, 'payment_failed')
-  })
-  */
+  // 2) Обновляем статус платежа
+  await sql`
+    UPDATE payments
+    SET status = 'failed',
+        provider_payment_id = ${params.transactionId},
+        updated_at = NOW()
+    WHERE id = ${payment.id}
+  `
+
+  // 3) Переводим подписку в grace‑period (3 дня)
+  const graceUntil = new Date()
+  graceUntil.setDate(graceUntil.getDate() + 3)
+
+  await sql`
+    UPDATE subscriptions
+    SET status = 'grace',
+        renew_at = ${graceUntil.toISOString()},
+        updated_at = NOW()
+    WHERE id = ${payment.subscription_id}
+  `
+
+  console.log(
+    `⚠️ Subscription ${payment.subscription_id} moved to grace period until ${graceUntil.toISOString()}`
+  )
+
+  // 4) (опционально) уведомление бота
+  // await notifyUser(payment.user_id, "payment_failed")
 }
